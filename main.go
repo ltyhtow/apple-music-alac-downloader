@@ -5,9 +5,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -31,6 +33,63 @@ const (
 var (
 	forbiddenNames = regexp.MustCompile(`[/\\<>:"|?*]`)
 )
+
+// SeekableBuffer is a buffer that implements io.WriteSeeker
+type SeekableBuffer struct {
+	buf []byte
+	pos int64
+}
+
+// NewSeekableBuffer creates a new SeekableBuffer
+func NewSeekableBuffer() *SeekableBuffer {
+	return &SeekableBuffer{
+		buf: make([]byte, 0),
+		pos: 0,
+	}
+}
+
+// Write implements io.Writer
+func (b *SeekableBuffer) Write(p []byte) (n int, err error) {
+	minCap := int(b.pos) + len(p)
+	if minCap > len(b.buf) {
+		newBuf := make([]byte, minCap)
+		copy(newBuf, b.buf)
+		b.buf = newBuf
+	}
+	copy(b.buf[b.pos:], p)
+	b.pos += int64(len(p))
+	return len(p), nil
+}
+
+// Seek implements io.Seeker
+func (b *SeekableBuffer) Seek(offset int64, whence int) (int64, error) {
+	var newPos int64
+	switch whence {
+	case io.SeekStart:
+		newPos = offset
+	case io.SeekCurrent:
+		newPos = b.pos + offset
+	case io.SeekEnd:
+		newPos = int64(len(b.buf)) + offset
+	default:
+		return 0, errors.New("invalid whence")
+	}
+	if newPos < 0 {
+		return 0, errors.New("negative position")
+	}
+	b.pos = newPos
+	return newPos, nil
+}
+
+// Bytes returns the buffer contents
+func (b *SeekableBuffer) Bytes() []byte {
+	return b.buf
+}
+
+// Len returns the length of the buffer
+func (b *SeekableBuffer) Len() int {
+	return len(b.buf)
+}
 
 type SampleInfo struct {
 	data      []byte
@@ -1042,13 +1101,33 @@ func rip(albumId string, token string, storefront string) error {
 }
 
 func main() {
+	// Parse command line flags
+	apiMode := flag.Bool("api", false, "Run as API server")
+	port := flag.String("port", "8080", "API server port")
+	flag.Parse()
+
+	if *apiMode {
+		// Run as API server
+		runAPIServer(*port)
+	} else {
+		// Run as CLI tool (original behavior)
+		runCLI()
+	}
+}
+
+// runCLI runs the original CLI functionality
+func runCLI() {
 	token, err := getToken()
 	if err != nil {
 		fmt.Println("Failed to get token.")
 		return
 	}
-	albumTotal := len(os.Args[1:])
-	for albumNum, url := range os.Args[1:] {
+	args := flag.Args()
+	if len(args) == 0 {
+		args = os.Args[1:]
+	}
+	albumTotal := len(args)
+	for albumNum, url := range args {
 		fmt.Printf("Album %d of %d:\n", albumNum+1, albumTotal)
 		storefront, albumId := checkUrl(url)
 		if albumId == "" {
@@ -1061,6 +1140,468 @@ func main() {
 			fmt.Println(err)
 		}
 	}
+}
+
+// APIResponse is a generic API response structure
+type APIResponse struct {
+	Success bool        `json:"success"`
+	Data    interface{} `json:"data,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
+// TrackStreamInfo contains information about a track for streaming
+type TrackStreamInfo struct {
+	TrackID      string `json:"trackId"`
+	TrackName    string `json:"trackName"`
+	ArtistName   string `json:"artistName"`
+	AlbumName    string `json:"albumName"`
+	DurationMs   int    `json:"durationMs"`
+	BitDepth     string `json:"bitDepth"`
+	SampleRate   string `json:"sampleRate"`
+	Available    bool   `json:"available"`
+}
+
+// runAPIServer starts the HTTP API server
+func runAPIServer(port string) {
+	log.Printf("Starting Apple Music API server on port %s", port)
+
+	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/api/album/", handleAlbum)
+	http.HandleFunc("/api/track/", handleTrack)
+
+	log.Printf("API endpoints available:")
+	log.Printf("  GET /health - Health check")
+	log.Printf("  GET /api/album/{storefront}/{albumId} - Get album metadata")
+	log.Printf("  GET /api/track/{storefront}/{trackId} - Stream track audio")
+
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+}
+
+// handleHealth handles the health check endpoint
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: "OK"})
+}
+
+// handleAlbum handles album metadata requests
+func handleAlbum(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Parse path: /api/album/{storefront}/{albumId}
+	path := strings.TrimPrefix(r.URL.Path, "/api/album/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: "Invalid path. Use /api/album/{storefront}/{albumId}"})
+		return
+	}
+
+	storefront := parts[0]
+	albumId := parts[1]
+
+	token, err := getToken()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: "Failed to get token"})
+		return
+	}
+
+	meta, err := getMeta(albumId, token, storefront)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: fmt.Sprintf("Failed to get album: %v", err)})
+		return
+	}
+
+	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: meta})
+}
+
+// handleTrack handles track streaming requests
+func handleTrack(w http.ResponseWriter, r *http.Request) {
+	// Parse path: /api/track/{storefront}/{trackId}
+	path := strings.TrimPrefix(r.URL.Path, "/api/track/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: "Invalid path. Use /api/track/{storefront}/{trackId}"})
+		return
+	}
+
+	storefront := parts[0]
+	trackId := parts[1]
+
+	// Check if info-only mode
+	infoOnly := r.URL.Query().Get("info") == "true"
+
+	token, err := getToken()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: "Failed to get token"})
+		return
+	}
+
+	manifest, err := getInfoFromAdam(trackId, token, storefront)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: fmt.Sprintf("Failed to get track info: %v", err)})
+		return
+	}
+
+	if manifest == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: "Track not found"})
+		return
+	}
+
+	// Check ALAC availability
+	available := manifest.Attributes.ExtendedAssetUrls.EnhancedHls != ""
+	
+	// Extract bit depth and sample rate from the manifest
+	bitDepth := ""
+	sampleRate := ""
+	if available {
+		trackUrl, _, err := extractMedia(manifest.Attributes.ExtendedAssetUrls.EnhancedHls)
+		if err == nil && trackUrl != "" {
+			// Parse from the URL or HLS info (simplified)
+			bitDepth = "24"  // Default for ALAC
+			sampleRate = "44100"
+		}
+	}
+
+	trackInfo := TrackStreamInfo{
+		TrackID:    trackId,
+		TrackName:  manifest.Attributes.Name,
+		ArtistName: manifest.Attributes.ArtistName,
+		AlbumName:  manifest.Attributes.AlbumName,
+		DurationMs: manifest.Attributes.DurationInMillis,
+		BitDepth:   bitDepth,
+		SampleRate: sampleRate,
+		Available:  available,
+	}
+
+	// If info-only mode, return track info as JSON
+	if infoOnly {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(APIResponse{Success: true, Data: trackInfo})
+		return
+	}
+
+	// For actual streaming, we need the decryption service running
+	if !available {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: "Track not available in ALAC format"})
+		return
+	}
+
+	// Stream the track
+	err = streamTrack(w, manifest, token, storefront)
+	if err != nil {
+		// If we haven't written headers yet
+		if w.Header().Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(APIResponse{Success: false, Error: fmt.Sprintf("Failed to stream track: %v", err)})
+		}
+	}
+}
+
+// streamTrack streams the audio track to the HTTP response
+func streamTrack(w http.ResponseWriter, manifest *SongData, token string, storefront string) error {
+	trackUrl, keys, err := extractMedia(manifest.Attributes.ExtendedAssetUrls.EnhancedHls)
+	if err != nil {
+		return fmt.Errorf("failed to extract media info: %v", err)
+	}
+
+	info, err := extractSong(trackUrl)
+	if err != nil {
+		return fmt.Errorf("failed to extract song: %v", err)
+	}
+
+	// Check sample/key alignment
+	for _, sample := range info.samples {
+		if int(sample.descIndex) >= len(keys) {
+			return fmt.Errorf("decryption size mismatch")
+		}
+	}
+
+	// Connect to decryption service
+	conn, err := net.Dial("tcp", "127.0.0.1:10020")
+	if err != nil {
+		return fmt.Errorf("decryption service unavailable: %v", err)
+	}
+	defer conn.Close()
+
+	var decrypted []byte
+	var lastIndex uint32 = math.MaxUint8
+
+	for _, sp := range info.samples {
+		if lastIndex != sp.descIndex {
+			if len(decrypted) != 0 {
+				_, err := conn.Write([]byte{0, 0, 0, 0})
+				if err != nil {
+					return err
+				}
+			}
+			keyUri := keys[sp.descIndex]
+			id := manifest.ID
+			if keyUri == prefetchKey {
+				id = defaultId
+			}
+
+			_, err := conn.Write([]byte{byte(len(id))})
+			if err != nil {
+				return err
+			}
+			_, err = io.WriteString(conn, id)
+			if err != nil {
+				return err
+			}
+
+			_, err = conn.Write([]byte{byte(len(keyUri))})
+			if err != nil {
+				return err
+			}
+			_, err = io.WriteString(conn, keyUri)
+			if err != nil {
+				return err
+			}
+		}
+		lastIndex = sp.descIndex
+
+		err := binary.Write(conn, binary.LittleEndian, uint32(len(sp.data)))
+		if err != nil {
+			return err
+		}
+
+		_, err = conn.Write(sp.data)
+		if err != nil {
+			return err
+		}
+
+		de := make([]byte, len(sp.data))
+		_, err = io.ReadFull(conn, de)
+		if err != nil {
+			return err
+		}
+
+		decrypted = append(decrypted, de...)
+	}
+	_, _ = conn.Write([]byte{0, 0, 0, 0, 0})
+
+	// Create M4A in memory and stream to response using seekable buffer
+	buf := NewSeekableBuffer()
+	err = writeM4aForStream(buf, info, manifest, decrypted)
+	if err != nil {
+		return fmt.Errorf("failed to create M4A: %v", err)
+	}
+
+	// Set appropriate headers for audio streaming
+	w.Header().Set("Content-Type", "audio/mp4")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.m4a\"", 
+		forbiddenNames.ReplaceAllString(manifest.Attributes.Name, "_")))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", buf.Len()))
+
+	_, err = w.Write(buf.Bytes())
+	return err
+}
+
+// writeM4aForStream writes M4A data for streaming (simplified version without full metadata)
+func writeM4aForStream(w io.WriteSeeker, info *SongInfo, manifest *SongData, data []byte) error {
+	writer := mp4.NewWriter(w)
+	
+	// Create a simplified AutoGenerated structure for the track
+	meta := &AutoGenerated{}
+	meta.Data = append(meta.Data, struct {
+		ID         string `json:"id"`
+		Type       string `json:"type"`
+		Href       string `json:"href"`
+		Attributes struct {
+			Artwork struct {
+				Width      int    `json:"width"`
+				Height     int    `json:"height"`
+				URL        string `json:"url"`
+				BgColor    string `json:"bgColor"`
+				TextColor1 string `json:"textColor1"`
+				TextColor2 string `json:"textColor2"`
+				TextColor3 string `json:"textColor3"`
+				TextColor4 string `json:"textColor4"`
+			} `json:"artwork"`
+			ArtistName          string   `json:"artistName"`
+			IsSingle            bool     `json:"isSingle"`
+			URL                 string   `json:"url"`
+			IsComplete          bool     `json:"isComplete"`
+			GenreNames          []string `json:"genreNames"`
+			TrackCount          int      `json:"trackCount"`
+			IsMasteredForItunes bool     `json:"isMasteredForItunes"`
+			ReleaseDate         string   `json:"releaseDate"`
+			Name                string   `json:"name"`
+			RecordLabel         string   `json:"recordLabel"`
+			Upc                 string   `json:"upc"`
+			AudioTraits         []string `json:"audioTraits"`
+			Copyright           string   `json:"copyright"`
+			PlayParams          struct {
+				ID   string `json:"id"`
+				Kind string `json:"kind"`
+			} `json:"playParams"`
+			IsCompilation bool `json:"isCompilation"`
+		} `json:"attributes"`
+		Relationships struct {
+			RecordLabels struct {
+				Href string        `json:"href"`
+				Data []interface{} `json:"data"`
+			} `json:"record-labels"`
+			Artists struct {
+				Href string `json:"href"`
+				Data []struct {
+					ID         string `json:"id"`
+					Type       string `json:"type"`
+					Href       string `json:"href"`
+					Attributes struct {
+						Name string `json:"name"`
+					} `json:"attributes"`
+				} `json:"data"`
+			} `json:"artists"`
+			Tracks struct {
+				Href string `json:"href"`
+				Data []struct {
+					ID         string `json:"id"`
+					Type       string `json:"type"`
+					Href       string `json:"href"`
+					Attributes struct {
+						Previews []struct {
+							URL string `json:"url"`
+						} `json:"previews"`
+						Artwork struct {
+							Width      int    `json:"width"`
+							Height     int    `json:"height"`
+							URL        string `json:"url"`
+							BgColor    string `json:"bgColor"`
+							TextColor1 string `json:"textColor1"`
+							TextColor2 string `json:"textColor2"`
+							TextColor3 string `json:"textColor3"`
+							TextColor4 string `json:"textColor4"`
+						} `json:"artwork"`
+						ArtistName          string   `json:"artistName"`
+						URL                 string   `json:"url"`
+						DiscNumber          int      `json:"discNumber"`
+						GenreNames          []string `json:"genreNames"`
+						HasTimeSyncedLyrics bool     `json:"hasTimeSyncedLyrics"`
+						IsMasteredForItunes bool     `json:"isMasteredForItunes"`
+						DurationInMillis    int      `json:"durationInMillis"`
+						ReleaseDate         string   `json:"releaseDate"`
+						Name                string   `json:"name"`
+						Isrc                string   `json:"isrc"`
+						AudioTraits         []string `json:"audioTraits"`
+						HasLyrics           bool     `json:"hasLyrics"`
+						AlbumName           string   `json:"albumName"`
+						PlayParams          struct {
+							ID   string `json:"id"`
+							Kind string `json:"kind"`
+						} `json:"playParams"`
+						TrackNumber  int    `json:"trackNumber"`
+						AudioLocale  string `json:"audioLocale"`
+						ComposerName string `json:"composerName"`
+					} `json:"attributes"`
+					Relationships struct {
+						Artists struct {
+							Href string `json:"href"`
+							Data []struct {
+								ID         string `json:"id"`
+								Type       string `json:"type"`
+								Href       string `json:"href"`
+								Attributes struct {
+									Name string `json:"name"`
+								} `json:"attributes"`
+							} `json:"data"`
+						} `json:"artists"`
+					} `json:"relationships"`
+				} `json:"data"`
+			} `json:"tracks"`
+		} `json:"relationships"`
+	}{})
+	
+	// Populate basic metadata
+	meta.Data[0].Attributes.Name = manifest.Attributes.AlbumName
+	meta.Data[0].Attributes.ArtistName = manifest.Attributes.ArtistName
+	meta.Data[0].Attributes.ReleaseDate = manifest.Attributes.ReleaseDate
+	meta.Data[0].Attributes.GenreNames = manifest.Attributes.GenreNames
+	
+	// Add single track
+	meta.Data[0].Relationships.Tracks.Data = append(meta.Data[0].Relationships.Tracks.Data, struct {
+		ID         string `json:"id"`
+		Type       string `json:"type"`
+		Href       string `json:"href"`
+		Attributes struct {
+			Previews []struct {
+				URL string `json:"url"`
+			} `json:"previews"`
+			Artwork struct {
+				Width      int    `json:"width"`
+				Height     int    `json:"height"`
+				URL        string `json:"url"`
+				BgColor    string `json:"bgColor"`
+				TextColor1 string `json:"textColor1"`
+				TextColor2 string `json:"textColor2"`
+				TextColor3 string `json:"textColor3"`
+				TextColor4 string `json:"textColor4"`
+			} `json:"artwork"`
+			ArtistName          string   `json:"artistName"`
+			URL                 string   `json:"url"`
+			DiscNumber          int      `json:"discNumber"`
+			GenreNames          []string `json:"genreNames"`
+			HasTimeSyncedLyrics bool     `json:"hasTimeSyncedLyrics"`
+			IsMasteredForItunes bool     `json:"isMasteredForItunes"`
+			DurationInMillis    int      `json:"durationInMillis"`
+			ReleaseDate         string   `json:"releaseDate"`
+			Name                string   `json:"name"`
+			Isrc                string   `json:"isrc"`
+			AudioTraits         []string `json:"audioTraits"`
+			HasLyrics           bool     `json:"hasLyrics"`
+			AlbumName           string   `json:"albumName"`
+			PlayParams          struct {
+				ID   string `json:"id"`
+				Kind string `json:"kind"`
+			} `json:"playParams"`
+			TrackNumber  int    `json:"trackNumber"`
+			AudioLocale  string `json:"audioLocale"`
+			ComposerName string `json:"composerName"`
+		} `json:"attributes"`
+		Relationships struct {
+			Artists struct {
+				Href string `json:"href"`
+				Data []struct {
+					ID         string `json:"id"`
+					Type       string `json:"type"`
+					Href       string `json:"href"`
+					Attributes struct {
+						Name string `json:"name"`
+					} `json:"attributes"`
+				} `json:"data"`
+			} `json:"artists"`
+		} `json:"relationships"`
+	}{
+		ID: manifest.ID,
+	})
+	
+	track := &meta.Data[0].Relationships.Tracks.Data[0]
+	track.Attributes.Name = manifest.Attributes.Name
+	track.Attributes.ArtistName = manifest.Attributes.ArtistName
+	track.Attributes.ComposerName = manifest.Attributes.ComposerName
+	track.Attributes.Isrc = manifest.Attributes.Isrc
+	track.Attributes.GenreNames = manifest.Attributes.GenreNames
+	track.Attributes.AlbumName = manifest.Attributes.AlbumName
+	track.Attributes.DiscNumber = manifest.Attributes.DiscNumber
+	track.Attributes.TrackNumber = manifest.Attributes.TrackNumber
+	track.Attributes.ReleaseDate = manifest.Attributes.ReleaseDate
+
+	return writeM4a(writer, info, meta, data, 1, 1)
 }
 
 func extractMedia(b string) (string, []string, error) {
@@ -1368,6 +1909,7 @@ type SongAttributes struct {
 	AlbumName           string `json:"albumName"`
 	TrackNumber         int    `json:"trackNumber"`
 	ComposerName        string `json:"composerName"`
+	DurationInMillis    int    `json:"durationInMillis"`
 }
 
 type AlbumAttributes struct {
