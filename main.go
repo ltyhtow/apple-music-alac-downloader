@@ -5,9 +5,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -24,13 +26,95 @@ import (
 )
 
 const (
-	defaultId   = "0"
-	prefetchKey = "skd://itunes.apple.com/P000000000/s1/e1"
+	defaultId            = "0"
+	prefetchKey          = "skd://itunes.apple.com/P000000000/s1/e1"
+	defaultALACBitDepth  = "24"
+	defaultALACSampleRate = "44100"
 )
 
 var (
 	forbiddenNames = regexp.MustCompile(`[/\\<>:"|?*]`)
 )
+
+// SeekableBuffer is a buffer that implements io.WriteSeeker
+type SeekableBuffer struct {
+	buf []byte
+	len int   // actual data length
+	pos int64 // current position
+}
+
+// NewSeekableBuffer creates a new SeekableBuffer
+func NewSeekableBuffer() *SeekableBuffer {
+	return &SeekableBuffer{
+		buf: make([]byte, 0, 4096), // pre-allocate 4KB
+		len: 0,
+		pos: 0,
+	}
+}
+
+// Write implements io.Writer
+func (b *SeekableBuffer) Write(p []byte) (n int, err error) {
+	writeEnd := int(b.pos) + len(p)
+	
+	// Grow buffer if needed using exponential growth
+	if writeEnd > cap(b.buf) {
+		newCap := cap(b.buf) * 2
+		if newCap < writeEnd {
+			newCap = writeEnd
+		}
+		if newCap < 4096 {
+			newCap = 4096
+		}
+		newBuf := make([]byte, newCap)
+		copy(newBuf, b.buf[:b.len])
+		b.buf = newBuf
+	}
+	
+	// Extend slice length if needed
+	if writeEnd > len(b.buf) {
+		b.buf = b.buf[:writeEnd]
+	}
+	
+	copy(b.buf[b.pos:], p)
+	b.pos += int64(len(p))
+	
+	// Update actual data length
+	if int(b.pos) > b.len {
+		b.len = int(b.pos)
+	}
+	
+	return len(p), nil
+}
+
+// Seek implements io.Seeker
+func (b *SeekableBuffer) Seek(offset int64, whence int) (int64, error) {
+	var newPos int64
+	switch whence {
+	case io.SeekStart:
+		newPos = offset
+	case io.SeekCurrent:
+		newPos = b.pos + offset
+	case io.SeekEnd:
+		newPos = int64(b.len) + offset
+	default:
+		return 0, errors.New("invalid whence")
+	}
+	if newPos < 0 {
+		return 0, errors.New("negative position")
+	}
+	b.pos = newPos
+	return newPos, nil
+}
+
+// Bytes returns the buffer contents
+func (b *SeekableBuffer) Bytes() []byte {
+	return b.buf[:b.len]
+}
+
+// Len returns the length of the buffer
+func (b *SeekableBuffer) Len() int {
+	return b.len
+}
 
 type SampleInfo struct {
 	data      []byte
@@ -1042,13 +1126,35 @@ func rip(albumId string, token string, storefront string) error {
 }
 
 func main() {
+	// Parse command line flags
+	apiMode := flag.Bool("api", false, "Run as API server")
+	port := flag.String("port", "8080", "API server port")
+	flag.Parse()
+
+	if *apiMode {
+		// Run as API server
+		runAPIServer(*port)
+	} else {
+		// Run as CLI tool (original behavior)
+		runCLI()
+	}
+}
+
+// runCLI runs the original CLI functionality
+func runCLI() {
 	token, err := getToken()
 	if err != nil {
 		fmt.Println("Failed to get token.")
 		return
 	}
-	albumTotal := len(os.Args[1:])
-	for albumNum, url := range os.Args[1:] {
+	args := flag.Args()
+	if len(args) == 0 {
+		fmt.Println("Usage: go run main.go [options] <album_url> [album_url...]")
+		fmt.Println("       go run main.go -api [-port 8080]")
+		return
+	}
+	albumTotal := len(args)
+	for albumNum, url := range args {
 		fmt.Printf("Album %d of %d:\n", albumNum+1, albumTotal)
 		storefront, albumId := checkUrl(url)
 		if albumId == "" {
@@ -1061,6 +1167,351 @@ func main() {
 			fmt.Println(err)
 		}
 	}
+}
+
+// APIResponse is a generic API response structure
+type APIResponse struct {
+	Success bool        `json:"success"`
+	Data    interface{} `json:"data,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
+// TrackStreamInfo contains information about a track for streaming
+type TrackStreamInfo struct {
+	TrackID      string `json:"trackId"`
+	TrackName    string `json:"trackName"`
+	ArtistName   string `json:"artistName"`
+	AlbumName    string `json:"albumName"`
+	DurationMs   int    `json:"durationMs"`
+	BitDepth     string `json:"bitDepth"`
+	SampleRate   string `json:"sampleRate"`
+	Available    bool   `json:"available"`
+}
+
+// runAPIServer starts the HTTP API server
+func runAPIServer(port string) {
+	log.Printf("Starting Apple Music API server on port %s", port)
+
+	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/api/album/", handleAlbum)
+	http.HandleFunc("/api/track/", handleTrack)
+
+	log.Printf("API endpoints available:")
+	log.Printf("  GET /health - Health check")
+	log.Printf("  GET /api/album/{storefront}/{albumId} - Get album metadata")
+	log.Printf("  GET /api/track/{storefront}/{trackId} - Stream track audio")
+
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+}
+
+// handleHealth handles the health check endpoint
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: "OK"})
+}
+
+// handleAlbum handles album metadata requests
+func handleAlbum(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Parse path: /api/album/{storefront}/{albumId}
+	path := strings.TrimPrefix(r.URL.Path, "/api/album/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: "Invalid path. Use /api/album/{storefront}/{albumId}"})
+		return
+	}
+
+	storefront := parts[0]
+	albumId := parts[1]
+
+	token, err := getToken()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: "Failed to get token"})
+		return
+	}
+
+	meta, err := getMeta(albumId, token, storefront)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: fmt.Sprintf("Failed to get album: %v", err)})
+		return
+	}
+
+	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: meta})
+}
+
+// handleTrack handles track streaming requests
+func handleTrack(w http.ResponseWriter, r *http.Request) {
+	// Parse path: /api/track/{storefront}/{trackId}
+	path := strings.TrimPrefix(r.URL.Path, "/api/track/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: "Invalid path. Use /api/track/{storefront}/{trackId}"})
+		return
+	}
+
+	storefront := parts[0]
+	trackId := parts[1]
+
+	// Check if info-only mode
+	infoOnly := r.URL.Query().Get("info") == "true"
+
+	token, err := getToken()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: "Failed to get token"})
+		return
+	}
+
+	manifest, err := getInfoFromAdam(trackId, token, storefront)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: fmt.Sprintf("Failed to get track info: %v", err)})
+		return
+	}
+
+	if manifest == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: "Track not found"})
+		return
+	}
+
+	// Check ALAC availability
+	available := manifest.Attributes.ExtendedAssetUrls.EnhancedHls != ""
+	
+	// Extract bit depth and sample rate from the manifest
+	bitDepth := ""
+	sampleRate := ""
+	if available {
+		trackUrl, _, err := extractMedia(manifest.Attributes.ExtendedAssetUrls.EnhancedHls)
+		if err == nil && trackUrl != "" {
+			bitDepth = defaultALACBitDepth
+			sampleRate = defaultALACSampleRate
+		}
+	}
+
+	trackInfo := TrackStreamInfo{
+		TrackID:    trackId,
+		TrackName:  manifest.Attributes.Name,
+		ArtistName: manifest.Attributes.ArtistName,
+		AlbumName:  manifest.Attributes.AlbumName,
+		DurationMs: manifest.Attributes.DurationInMillis,
+		BitDepth:   bitDepth,
+		SampleRate: sampleRate,
+		Available:  available,
+	}
+
+	// If info-only mode, return track info as JSON
+	if infoOnly {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(APIResponse{Success: true, Data: trackInfo})
+		return
+	}
+
+	// For actual streaming, we need the decryption service running
+	if !available {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Error: "Track not available in ALAC format"})
+		return
+	}
+
+	// Stream the track
+	err = streamTrack(w, manifest, token, storefront)
+	if err != nil {
+		// Log the error - we may not be able to send it to the client if streaming has started
+		log.Printf("Error streaming track %s: %v", trackId, err)
+		// Only try to write error response if content-type header hasn't been set to audio
+		// (indicates headers haven't been written yet for the actual stream)
+		contentType := w.Header().Get("Content-Type")
+		if contentType == "" || contentType == "application/json" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(APIResponse{Success: false, Error: fmt.Sprintf("Failed to stream track: %v", err)})
+		}
+	}
+}
+
+// streamTrack streams the audio track to the HTTP response
+func streamTrack(w http.ResponseWriter, manifest *SongData, token string, storefront string) error {
+	trackUrl, keys, err := extractMedia(manifest.Attributes.ExtendedAssetUrls.EnhancedHls)
+	if err != nil {
+		return fmt.Errorf("failed to extract media info: %v", err)
+	}
+
+	info, err := extractSong(trackUrl)
+	if err != nil {
+		return fmt.Errorf("failed to extract song: %v", err)
+	}
+
+	// Check sample/key alignment
+	for _, sample := range info.samples {
+		if int(sample.descIndex) >= len(keys) {
+			return fmt.Errorf("decryption size mismatch")
+		}
+	}
+
+	// Connect to decryption service
+	conn, err := net.Dial("tcp", "127.0.0.1:10020")
+	if err != nil {
+		return fmt.Errorf("decryption service unavailable: %v", err)
+	}
+	defer conn.Close()
+
+	var decrypted []byte
+	var lastIndex uint32 = math.MaxUint8
+
+	for _, sp := range info.samples {
+		if lastIndex != sp.descIndex {
+			if len(decrypted) != 0 {
+				_, err := conn.Write([]byte{0, 0, 0, 0})
+				if err != nil {
+					return err
+				}
+			}
+			keyUri := keys[sp.descIndex]
+			id := manifest.ID
+			if keyUri == prefetchKey {
+				id = defaultId
+			}
+
+			_, err := conn.Write([]byte{byte(len(id))})
+			if err != nil {
+				return err
+			}
+			_, err = io.WriteString(conn, id)
+			if err != nil {
+				return err
+			}
+
+			_, err = conn.Write([]byte{byte(len(keyUri))})
+			if err != nil {
+				return err
+			}
+			_, err = io.WriteString(conn, keyUri)
+			if err != nil {
+				return err
+			}
+		}
+		lastIndex = sp.descIndex
+
+		err := binary.Write(conn, binary.LittleEndian, uint32(len(sp.data)))
+		if err != nil {
+			return err
+		}
+
+		_, err = conn.Write(sp.data)
+		if err != nil {
+			return err
+		}
+
+		de := make([]byte, len(sp.data))
+		_, err = io.ReadFull(conn, de)
+		if err != nil {
+			return err
+		}
+
+		decrypted = append(decrypted, de...)
+	}
+	_, _ = conn.Write([]byte{0, 0, 0, 0, 0})
+
+	// Create M4A in memory and stream to response using seekable buffer
+	buf := NewSeekableBuffer()
+	err = writeM4aForStream(buf, info, manifest, decrypted)
+	if err != nil {
+		return fmt.Errorf("failed to create M4A: %v", err)
+	}
+
+	// Set appropriate headers for audio streaming
+	w.Header().Set("Content-Type", "audio/mp4")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.m4a\"", 
+		forbiddenNames.ReplaceAllString(manifest.Attributes.Name, "_")))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", buf.Len()))
+
+	_, err = w.Write(buf.Bytes())
+	return err
+}
+
+// buildMetaForSingleTrack creates an AutoGenerated structure for a single track
+func buildMetaForSingleTrack(manifest *SongData) *AutoGenerated {
+	meta := &AutoGenerated{}
+	
+	// Initialize with one data entry - use JSON marshaling/unmarshaling as a workaround
+	// for the complex anonymous struct initialization
+	metaJSON := fmt.Sprintf(`{
+		"data": [{
+			"id": "",
+			"type": "",
+			"href": "",
+			"attributes": {
+				"artistName": %q,
+				"name": %q,
+				"releaseDate": %q,
+				"genreNames": [],
+				"isCompilation": false
+			},
+			"relationships": {
+				"tracks": {
+					"data": [{
+						"id": %q,
+						"attributes": {
+							"name": %q,
+							"artistName": %q,
+							"composerName": %q,
+							"isrc": %q,
+							"genreNames": [],
+							"albumName": %q,
+							"discNumber": %d,
+							"trackNumber": %d,
+							"releaseDate": %q
+						}
+					}]
+				}
+			}
+		}]
+	}`,
+		manifest.Attributes.ArtistName,
+		manifest.Attributes.AlbumName,
+		manifest.Attributes.ReleaseDate,
+		manifest.ID,
+		manifest.Attributes.Name,
+		manifest.Attributes.ArtistName,
+		manifest.Attributes.ComposerName,
+		manifest.Attributes.Isrc,
+		manifest.Attributes.AlbumName,
+		manifest.Attributes.DiscNumber,
+		manifest.Attributes.TrackNumber,
+		manifest.Attributes.ReleaseDate,
+	)
+	
+	json.Unmarshal([]byte(metaJSON), meta)
+	
+	// Copy genre names if available
+	if len(manifest.Attributes.GenreNames) > 0 && len(meta.Data) > 0 {
+		meta.Data[0].Attributes.GenreNames = manifest.Attributes.GenreNames
+		if len(meta.Data[0].Relationships.Tracks.Data) > 0 {
+			meta.Data[0].Relationships.Tracks.Data[0].Attributes.GenreNames = manifest.Attributes.GenreNames
+		}
+	}
+	
+	return meta
+}
+
+// writeM4aForStream writes M4A data for streaming (simplified version without full metadata)
+func writeM4aForStream(w io.WriteSeeker, info *SongInfo, manifest *SongData, data []byte) error {
+	writer := mp4.NewWriter(w)
+	meta := buildMetaForSingleTrack(manifest)
+	return writeM4a(writer, info, meta, data, 1, 1)
 }
 
 func extractMedia(b string) (string, []string, error) {
@@ -1368,6 +1819,7 @@ type SongAttributes struct {
 	AlbumName           string `json:"albumName"`
 	TrackNumber         int    `json:"trackNumber"`
 	ComposerName        string `json:"composerName"`
+	DurationInMillis    int    `json:"durationInMillis"`
 }
 
 type AlbumAttributes struct {
